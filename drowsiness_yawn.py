@@ -4,6 +4,7 @@ from scipy.spatial import distance as dist
 from imutils.video import VideoStream
 from imutils import face_utils
 from threading import Thread
+from collections import deque
 import numpy as np
 import argparse
 import imutils
@@ -15,23 +16,46 @@ import os
 import ctypes
 
 
-def sound_alarm(path):
-    global alarm_status
-    global alarm_status2
-    global saying
+alarm_playing = False
 
+
+def sound_alarm(path):
+    global alarm_playing
+    # Play sound only once, not in loop
     if not os.path.exists(path):
         print(f"Alarm file not found: {path}")
+        alarm_playing = False
         return
+    
+    try:
+        playsound.playsound(path)
+    except Exception as e:
+        print(f"Error playing sound: {e}")
+    finally:
+        alarm_playing = False
 
-    while alarm_status:
-        print('call')
-        playsound.playsound(path)
-    if alarm_status2:
-        print('call')
-        saying = True
-        playsound.playsound(path)
-        saying = False
+
+def trigger_alarm(path, alarm_sound_time, alarm_cooldown, block_if_yawn=False, yawn_alert_until=0):
+    global alarm_playing
+    current_time = time.time()
+
+    # While yawn alert is active, suppress all non-yawn sirens.
+    if block_if_yawn and current_time < yawn_alert_until:
+        return False, alarm_sound_time
+
+    if alarm_playing or (current_time - alarm_sound_time) < alarm_cooldown:
+        return False, alarm_sound_time
+
+    alarm_playing = True
+    alarm_sound_time = current_time
+    if path != "":
+        t = Thread(target=sound_alarm, args=(path,))
+        t.daemon = True
+        t.start()
+    else:
+        alarm_playing = False
+
+    return True, alarm_sound_time
 
 def eye_aspect_ratio(eye):
     A = dist.euclidean(eye[1], eye[5])
@@ -93,6 +117,30 @@ def fit_frame_to_screen(frame, screen_width, screen_height, header_height=70):
     return canvas
 
 
+def draw_compact_metrics(frame, ear_value, yawn_value):
+    panel_width = 160
+    panel_height = 92
+    x1 = frame.shape[1] - panel_width - 8
+    y1 = 8
+    x2 = x1 + panel_width
+    y2 = y1 + panel_height
+
+    # Small, clean metrics panel to avoid large distracting text on the video.
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (25, 25, 25), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.45
+    thickness = 1
+    color = (200, 230, 255)
+
+    cv2.putText(frame, f"EAR: {ear_value:.2f}", (x1 + 8, y1 + 20), font, scale, color, thickness)
+    cv2.putText(frame, f"ETHR: {EYE_AR_THRESH:.2f}", (x1 + 8, y1 + 40), font, scale, color, thickness)
+    cv2.putText(frame, f"YAWN: {yawn_value:.2f}", (x1 + 8, y1 + 60), font, scale, color, thickness)
+    cv2.putText(frame, f"YTHR: {YAWN_THRESH:.2f}", (x1 + 8, y1 + 80), font, scale, color, thickness)
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument("-w", "--webcam", type=int, default=0,
                 help="index of webcam on system")
@@ -102,11 +150,22 @@ args = vars(ap.parse_args())
 EYE_AR_THRESH = 0.3
 EYE_AR_CONSEC_FRAMES = 30
 YAWN_THRESH = 20
+YAWN_SMOOTHING_WINDOW = 5
+YAWN_CONSEC_FRAMES = 8
 alarm_status = False
 alarm_status2 = False
-saying = False
 COUNTER = 0
+yawn_counter = 0
+yawn_distances = deque(maxlen=YAWN_SMOOTHING_WINDOW)
 yawn_alert_until = 0
+drowsiness_alert_until = 0  # Persist drowsiness message for duration
+face_detection_alert_until = 0  # Persist face detection message for duration
+poor_lighting_alert_until = 0  # Persist poor lighting message for duration
+face_not_detected_frames = 0
+face_detection_threshold = 75  # Alert only after 75 frames (3 sec) without face detection - allows normal glances
+alarm_sound_time = 0  # Track when last alarm sound played
+alarm_cooldown = 3.0  # Minimum seconds between alarm sounds
+alert_display_duration = 2.5  # How long to show alert message (seconds)
 
 print("-> Loading the predictor and detector...")
 #detector = dlib.get_frontal_face_detector()
@@ -136,6 +195,26 @@ while True:
 		minNeighbors=5, minSize=(30, 30),
 		flags=cv2.CASCADE_SCALE_IMAGE)
 
+    # Handle face detection failure (only alert if face missing for sustained time)
+    if len(rects) == 0:
+        face_not_detected_frames += 1
+        if face_not_detected_frames >= face_detection_threshold:
+            current_time = time.time()
+            if alarm_status == False:
+                alarm_status = True
+                played, alarm_sound_time = trigger_alarm(
+                    args["alarm"],
+                    alarm_sound_time,
+                    alarm_cooldown,
+                    block_if_yawn=True,
+                    yawn_alert_until=yawn_alert_until,
+                )
+                if played:
+                    face_detection_alert_until = current_time + alert_display_duration
+    else:
+        face_not_detected_frames = 0
+        alarm_status = False
+
     #for rect in rects:
     for (x, y, w, h) in rects:
         rect = dlib.rectangle(int(x), int(y), int(x + w),int(y + h))
@@ -149,6 +228,8 @@ while True:
         rightEye = eye[2]
 
         distance = lip_distance(shape)
+        yawn_distances.append(distance)
+        smoothed_yawn = float(np.mean(yawn_distances))
 
         leftEyeHull = cv2.convexHull(leftEye)
         rightEyeHull = cv2.convexHull(rightEye)
@@ -158,45 +239,78 @@ while True:
         lip = shape[48:60]
         cv2.drawContours(frame, [lip], -1, (0, 255, 0), 1)
 
-        if ear < EYE_AR_THRESH:
-            COUNTER += 1
-
-            if COUNTER >= EYE_AR_CONSEC_FRAMES:
-                if alarm_status == False:
-                    alarm_status = True
-                    if args["alarm"] != "":
-                        t = Thread(target=sound_alarm,
-                                   args=(args["alarm"],))
-                    t.daemon = True
-                    t.start()
-
-                cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
+        # Check for poor lighting (unable to detect eyes accurately)
+        if ear < 0.05 or ear > 1.0:  # Invalid EAR range indicates poor lighting
+            current_time = time.time()
+            poor_lighting_alert_until = current_time + alert_display_duration
         else:
-            COUNTER = 0
-            alarm_status = False
+            if ear < EYE_AR_THRESH:
+                COUNTER += 1
 
-        if (distance > YAWN_THRESH):
-                yawn_alert_until = time.time() + 2.5
-                if alarm_status2 == False and saying == False:
-                    alarm_status2 = True
-                    if args["alarm"] != "":
-                        t = Thread(target=sound_alarm,
-                                   args=(args["alarm"],))
-                        t.daemon = True
-                        t.start()
-        else:
-            alarm_status2 = False
+                if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                    current_time = time.time()
+                    if alarm_status == False:
+                        alarm_status = True
+                        played, alarm_sound_time = trigger_alarm(
+                            args["alarm"],
+                            alarm_sound_time,
+                            alarm_cooldown,
+                            block_if_yawn=True,
+                            yawn_alert_until=yawn_alert_until,
+                        )
+                        if played:
+                            drowsiness_alert_until = current_time + alert_display_duration
 
-        cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                COUNTER = 0
+                alarm_status = False
+
+            if smoothed_yawn > YAWN_THRESH:
+                yawn_counter += 1
+            else:
+                yawn_counter = 0
+                alarm_status2 = False
+
+            if yawn_counter >= YAWN_CONSEC_FRAMES and time.time() >= yawn_alert_until:
+                    yawn_alert_until = time.time() + alert_display_duration
+                    yawn_counter = 0
+                    COUNTER = 0  # Reset eye-closure counter when yawning
+                    alarm_status = False  # Cancel drowsiness alarm status
+                    drowsiness_alert_until = 0  # Prevent stale eyes-closed message during yawns
+                    face_detection_alert_until = 0  # Prevent overlap with face detection siren/message
+                    poor_lighting_alert_until = 0  # Prevent overlap with poor lighting siren/message
+                    played, alarm_sound_time = trigger_alarm(
+                        args["alarm"],
+                        alarm_sound_time,
+                        alarm_cooldown,
+                        block_if_yawn=False,
+                    )
+                    if played:
+                        alarm_status2 = True
+
+
+        draw_compact_metrics(frame, ear, smoothed_yawn)
 
     display_frame = fit_frame_to_screen(frame, screen_width, screen_height)
+    
+    # Display drowsiness alert message while siren rings
+    if time.time() < drowsiness_alert_until and time.time() >= yawn_alert_until:
+        cv2.putText(display_frame, "DROWSINESS DETECTED - Eyes Closed!", (10, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # Display yawn alert message while siren rings
     if time.time() < yawn_alert_until:
-        cv2.putText(display_frame, "Yawn Alert", (10, 100),
+        cv2.putText(display_frame, "DROWSINESS DETECTED - Yawning!", (10, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # Display face not detected alert message while siren rings
+    if time.time() < face_detection_alert_until and time.time() >= yawn_alert_until:
+        cv2.putText(display_frame, "Face Out of Frame - Monitoring Paused", (10, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # Display poor lighting alert message while siren rings
+    if time.time() < poor_lighting_alert_until and time.time() >= yawn_alert_until:
+        cv2.putText(display_frame, "Poor Lighting - Unable to detect eyes", (10, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     cv2.imshow("Frame", display_frame)
     key = cv2.waitKey(1) & 0xFF
